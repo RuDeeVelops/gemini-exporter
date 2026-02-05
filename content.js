@@ -1,231 +1,278 @@
 // Content script that extracts chat messages from Gemini
-// This loads the entire chat history before extraction
+// Forces loading of ENTIRE chat history by scrolling to top
 
-// Find the scrollable chat container
-function findChatContainer() {
-  // Try multiple possible selectors for Gemini's chat container
-  const selectors = [
-    '[role="main"]',
-    'main',
-    '.conversation-container',
-    '.chat-history',
-    '[class*="conversation"]',
-    '[class*="chat-content"]'
-  ];
-  
-  for (const selector of selectors) {
-    const element = document.querySelector(selector);
-    if (element && element.scrollHeight > element.clientHeight) {
-      return element;
-    }
-  }
-  
-  // Fallback: find any scrollable element in the page
+// Global state for progress tracking
+let isLoading = false;
+let loadingProgress = { loaded: 0, status: 'idle' };
+
+// Find the ACTUAL scrollable container (the one that holds messages)
+function findScrollableContainer() {
+  // Strategy 1: Find element with overflow-y scroll/auto that has significant scroll
   const allElements = document.querySelectorAll('*');
+  let bestCandidate = null;
+  let maxScrollHeight = 0;
+  
   for (const el of allElements) {
-    if (el.scrollHeight > el.clientHeight && el.scrollHeight > 1000) {
-      return el;
+    const style = window.getComputedStyle(el);
+    const overflowY = style.overflowY;
+    
+    if ((overflowY === 'scroll' || overflowY === 'auto') && 
+        el.scrollHeight > el.clientHeight + 100) {
+      // This element is scrollable
+      // Prefer elements with more content (larger scrollHeight)
+      if (el.scrollHeight > maxScrollHeight) {
+        maxScrollHeight = el.scrollHeight;
+        bestCandidate = el;
+      }
     }
   }
   
+  if (bestCandidate) {
+    console.log('[Gemini Exporter] Found scrollable container:', bestCandidate, 'scrollHeight:', maxScrollHeight);
+    return bestCandidate;
+  }
+  
+  // Fallback to document
+  console.log('[Gemini Exporter] Using document.documentElement as fallback');
   return document.documentElement;
 }
 
-// Load the entire chat history by scrolling
-async function loadEntireChatHistory() {
-  const container = findChatContainer();
+// FORCE scroll to absolute top and load ALL history
+async function forceLoadEntireHistory(sendProgress) {
+  console.log('[Gemini Exporter] Starting to force load entire chat history...');
+  
+  const container = findScrollableContainer();
   if (!container) {
-    console.warn('Could not find chat container');
-    return false;
+    throw new Error('Could not find chat container');
   }
   
-  const originalScrollTop = container.scrollTop;
-  const originalScrollBehavior = container.style.scrollBehavior;
-  
-  // Disable smooth scrolling for faster loading
+  // Disable smooth scrolling for speed
+  const originalBehavior = container.style.scrollBehavior;
   container.style.scrollBehavior = 'auto';
   
-  // Phase 1: Jump to the very top to load the oldest messages
-  container.scrollTop = 0;
-  await wait(1000); // Initial wait for first messages to load
+  // Get initial state
+  let previousScrollTop = container.scrollTop;
+  let previousScrollHeight = container.scrollHeight;
+  let stuckCount = 0;
+  let iteration = 0;
+  const maxIterations = 500; // Safety limit - 500 scroll attempts
   
-  let previousHeight = container.scrollHeight;
-  let stableCount = 0;
-  let heightCheckAttempts = 0;
-  const maxHeightChecks = 5;
+  sendProgress({ status: 'loading', message: 'Scrolling to load history...', iteration: 0 });
   
-  // Wait for the top messages to fully load
-  while (heightCheckAttempts < maxHeightChecks) {
-    await wait(400);
-    const currentHeight = container.scrollHeight;
+  // SCROLL UP AGGRESSIVELY until we hit the top
+  while (iteration < maxIterations) {
+    iteration++;
     
-    if (currentHeight === previousHeight) {
-      stableCount++;
-      if (stableCount >= 2) break; // Height stable, content loaded
+    // Jump to TOP
+    container.scrollTop = 0;
+    
+    // Also try scrolling the main containers
+    document.documentElement.scrollTop = 0;
+    document.body.scrollTop = 0;
+    
+    // Trigger scroll events manually to force lazy loading
+    container.dispatchEvent(new Event('scroll', { bubbles: true }));
+    
+    // Wait for content to potentially load
+    await wait(300);
+    
+    // Check if new content appeared (scrollHeight increased means new content at top)
+    const currentScrollHeight = container.scrollHeight;
+    const currentScrollTop = container.scrollTop;
+    
+    console.log(`[Gemini Exporter] Iteration ${iteration}: scrollHeight=${currentScrollHeight}, scrollTop=${currentScrollTop}`);
+    
+    // Send progress update
+    if (iteration % 5 === 0) {
+      sendProgress({ 
+        status: 'loading', 
+        message: `Loading history... (${iteration} iterations, ${Math.round(currentScrollHeight/1024)}KB loaded)`,
+        iteration 
+      });
+    }
+    
+    // Check if we're stuck (no new content loading)
+    if (currentScrollHeight === previousScrollHeight && currentScrollTop === 0) {
+      stuckCount++;
+      
+      // Try harder - trigger multiple scroll events
+      if (stuckCount < 3) {
+        container.scrollTop = 100; // Scroll down a bit
+        await wait(100);
+        container.scrollTop = 0; // Then back to top
+        container.dispatchEvent(new Event('scroll', { bubbles: true }));
+        await wait(500);
+      }
+      
+      // If stuck for 5 consecutive checks, we've likely loaded everything
+      if (stuckCount >= 5) {
+        console.log('[Gemini Exporter] Reached the top - no more content to load');
+        break;
+      }
     } else {
-      stableCount = 0;
-      previousHeight = currentHeight;
+      stuckCount = 0;
+      previousScrollHeight = currentScrollHeight;
     }
     
-    heightCheckAttempts++;
+    previousScrollTop = currentScrollTop;
   }
   
-  // Phase 2: Intelligently scroll through the content
+  sendProgress({ status: 'loading', message: 'Verifying all content loaded...', iteration });
+  
+  // Final verification - scroll through entire chat to ensure everything is rendered
   const totalHeight = container.scrollHeight;
-  const viewportHeight = container.clientHeight;
-  const numSteps = Math.max(10, Math.min(30, Math.ceil(totalHeight / (viewportHeight * 2))));
-  const stepSize = totalHeight / numSteps;
+  const step = Math.max(500, container.clientHeight);
   
-  for (let i = 0; i < numSteps; i++) {
-    const targetScroll = Math.min(stepSize * (i + 1), totalHeight);
-    container.scrollTop = targetScroll;
-    
-    // Dynamic wait time based on position
-    const waitTime = i < 3 ? 400 : 200; // Wait longer for initial messages
-    await wait(waitTime);
-    
-    // Check if we've reached the end
-    if (container.scrollTop + container.clientHeight >= container.scrollHeight - 50) {
-      break;
-    }
+  for (let pos = 0; pos <= totalHeight; pos += step) {
+    container.scrollTop = pos;
+    await wait(100);
   }
   
-  // Phase 3: Ensure we're at the absolute bottom
-  container.scrollTop = container.scrollHeight;
-  await wait(500);
+  // Go back to top for extraction
+  container.scrollTop = 0;
+  await wait(200);
   
-  // Restore original scroll behavior
-  container.style.scrollBehavior = originalScrollBehavior;
+  // Restore scroll behavior
+  container.style.scrollBehavior = originalBehavior;
+  
+  console.log(`[Gemini Exporter] Finished loading. Final scrollHeight: ${container.scrollHeight}`);
+  sendProgress({ status: 'extracting', message: 'Extracting messages...', iteration });
   
   return true;
 }
 
-// Count messages currently in the DOM
-function countCurrentMessages() {
-  const messageSelectors = [
-    'message-content',
-    '[data-message-author-role]',
-    '.model-response-text',
-    '.user-query'
-  ];
-  
-  let count = 0;
-  for (const selector of messageSelectors) {
-    const elements = document.querySelectorAll(selector);
-    if (elements.length > count) {
-      count = elements.length;
-    }
-  }
-  
-  return count;
-}
-
-// Helper function to wait
+// Wait helper
 function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // Extract all chat messages from the DOM (after history is loaded)
 function extractChatMessages() {
+  console.log('[Gemini Exporter] Starting message extraction...');
+  
   const messages = [];
-  const seenContents = new Set(); // To deduplicate
+  const seenContents = new Set();
   
-  // Strategy 1: Look for specific message container patterns
-  const chatContainer = document.querySelector('main, [role="main"], .conversation-container');
-  
-  if (!chatContainer) {
-    console.warn('Could not find chat container');
-    return messages;
-  }
-  
-  // Try to find message containers with known patterns
-  // Gemini typically uses specific data attributes or classes
-  const messageSelectors = [
+  // STRATEGY 1: Look for turns/conversation containers
+  // These are the main message wrappers in Gemini
+  const turnSelectors = [
     '[data-message-author-role]',
-    'message-content',
-    '.message-content',
-    '[class*="message-"]',
-    '[class*="query"]',
-    '[class*="response"]'
+    '.conversation-turn',
+    '[class*="turn-"]',
+    '[class*="message-wrapper"]',
+    'model-response',
+    'user-query'
   ];
   
-  let foundMessages = [];
-  for (const selector of messageSelectors) {
-    const elements = chatContainer.querySelectorAll(selector);
+  for (const selector of turnSelectors) {
+    const elements = document.querySelectorAll(selector);
+    console.log(`[Gemini Exporter] Trying selector "${selector}": found ${elements.length} elements`);
+    
     if (elements.length > 0) {
-      foundMessages = Array.from(elements);
+      elements.forEach((el, idx) => {
+        const role = determineRole(el);
+        const text = extractText(el);
+        
+        if (text && text.length > 5) {
+          const key = text.substring(0, 200);
+          if (!seenContents.has(key)) {
+            seenContents.add(key);
+            messages.push({
+              role: role,
+              content: text.trim(),
+              index: idx,
+              timestamp: new Date().toISOString()
+            });
+          }
+        }
+      });
+      
+      if (messages.length > 0) {
+        console.log(`[Gemini Exporter] Strategy 1 found ${messages.length} messages with selector "${selector}"`);
+        return messages;
+      }
+    }
+  }
+  
+  // STRATEGY 2: Look for any element with text that looks like a conversation
+  console.log('[Gemini Exporter] Strategy 1 failed, trying Strategy 2...');
+  
+  // Find the main content area
+  const mainAreas = document.querySelectorAll('main, [role="main"], [class*="chat"], [class*="conversation"]');
+  
+  for (const main of mainAreas) {
+    // Get all text-bearing elements at a reasonable depth
+    const textElements = main.querySelectorAll('p, div, span, pre, code');
+    
+    const textContents = [];
+    textElements.forEach(el => {
+      const text = el.textContent?.trim() || '';
+      // Only consider substantial text blocks
+      if (text.length > 20 && text.length < 100000) {
+        // Check this isn't a container of other text elements
+        const childText = Array.from(el.children)
+          .map(c => c.textContent?.trim() || '')
+          .join('');
+        
+        // If element's text is mostly from children, skip (it's a container)
+        if (childText.length < text.length * 0.8) {
+          textContents.push({
+            element: el,
+            text: text,
+            depth: getElementDepth(el, main)
+          });
+        }
+      }
+    });
+    
+    // Group by content to find unique messages
+    const uniqueTexts = new Map();
+    textContents.forEach(item => {
+      const key = item.text.substring(0, 200);
+      if (!uniqueTexts.has(key)) {
+        uniqueTexts.set(key, item);
+      }
+    });
+    
+    uniqueTexts.forEach((item, key) => {
+      if (!seenContents.has(key) && isValidMessage(item.element, item.text)) {
+        seenContents.add(key);
+        messages.push({
+          role: determineRole(item.element),
+          content: item.text,
+          timestamp: new Date().toISOString()
+        });
+      }
+    });
+    
+    if (messages.length > 0) {
+      console.log(`[Gemini Exporter] Strategy 2 found ${messages.length} messages`);
       break;
     }
   }
   
-  // Process found message containers
-  if (foundMessages.length > 0) {
-    foundMessages.forEach(el => {
-      const role = determineRole(el);
-      const textContent = extractText(el);
-      
-      if (textContent && textContent.length > 10) {
-        const contentKey = textContent.substring(0, 150);
-        if (!seenContents.has(contentKey) && isValidMessage(el, textContent)) {
-          seenContents.add(contentKey);
-          messages.push({
-            role: role,
-            content: textContent.trim(),
-            timestamp: new Date().toISOString()
-          });
-        }
+  // STRATEGY 3: Last resort - grab everything that looks like text
+  if (messages.length === 0) {
+    console.log('[Gemini Exporter] Strategy 2 failed, trying Strategy 3...');
+    
+    const bodyText = document.body.innerText;
+    const lines = bodyText.split('\n').filter(l => l.trim().length > 20);
+    
+    lines.forEach((line, idx) => {
+      const trimmed = line.trim();
+      if (trimmed.length > 20 && !seenContents.has(trimmed.substring(0, 200))) {
+        seenContents.add(trimmed.substring(0, 200));
+        messages.push({
+          role: idx % 2 === 0 ? 'user' : 'assistant',
+          content: trimmed,
+          timestamp: new Date().toISOString()
+        });
       }
     });
-  } else {
-    // Strategy 2: Find message-like containers based on structure
-    // Look for direct children or specific depth elements
-    const potentialContainers = chatContainer.querySelectorAll('div[class], div[data-test-id]');
-    
-    // Filter to likely message containers (not too nested, has substantial content)
-    const likelyMessages = Array.from(potentialContainers).filter(el => {
-      const depth = getElementDepth(el, chatContainer);
-      const textLength = (el.textContent || '').trim().length;
-      const hasChildren = el.children.length > 0;
-      
-      // Message containers are usually at a specific depth and have reasonable content
-      return depth >= 2 && depth <= 6 && textLength > 50 && textLength < 50000;
-    });
-    
-    // Sort by position in DOM to maintain order
-    likelyMessages.sort((a, b) => {
-      return a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
-    });
-    
-    // Process each potential message
-    for (const el of likelyMessages) {
-      const textContent = extractText(el);
-      
-      if (textContent && textContent.length > 10) {
-        const contentKey = textContent.substring(0, 150);
-        
-        // Check if this is not a subset of an already seen message
-        let isSubset = false;
-        for (const seen of seenContents) {
-          if (seen.includes(contentKey) || contentKey.includes(seen)) {
-            isSubset = true;
-            break;
-          }
-        }
-        
-        if (!isSubset && isValidMessage(el, textContent)) {
-          seenContents.add(contentKey);
-          const role = determineRole(el);
-          messages.push({
-            role: role,
-            content: textContent.trim(),
-            timestamp: new Date().toISOString()
-          });
-        }
-      }
-    }
   }
   
-  return deduplicateAndSortMessages(messages);
+  console.log(`[Gemini Exporter] Total messages extracted: ${messages.length}`);
+  return messages;
 }
 
 // Get the depth of an element relative to a container
@@ -394,15 +441,26 @@ function getChatTitle() {
 // Listen for messages from popup
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'extractChat') {
-    // Handle async operation
+    // Handle async operation with progress updates
     (async () => {
       try {
-        // First, load the entire chat history by scrolling
-        await loadEntireChatHistory();
+        // Progress callback - sends updates to popup
+        const sendProgress = (progress) => {
+          try {
+            chrome.runtime.sendMessage({ action: 'progress', ...progress });
+          } catch (e) {
+            // Popup might be closed, ignore
+          }
+        };
         
-        // Then extract all messages
+        // FORCE load the entire chat history by scrolling to TOP
+        await forceLoadEntireHistory(sendProgress);
+        
+        // Extract all messages from the fully loaded DOM
         const messages = extractChatMessages();
         const title = getChatTitle();
+        
+        console.log(`[Gemini Exporter] Extracted ${messages.length} messages`);
         
         sendResponse({
           success: true,
@@ -414,6 +472,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           }
         });
       } catch (error) {
+        console.error('[Gemini Exporter] Error:', error);
         sendResponse({
           success: false,
           error: error.message
@@ -426,27 +485,5 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   return true;
 });
 
-// Alternative extraction method using MutationObserver for dynamic content
-let cachedMessages = [];
-
-function observeChat() {
-  const chatContainer = document.querySelector('main, .chat-history, .conversation');
-  
-  if (chatContainer) {
-    const observer = new MutationObserver(() => {
-      cachedMessages = extractChatMessages();
-    });
-    
-    observer.observe(chatContainer, {
-      childList: true,
-      subtree: true
-    });
-  }
-}
-
-// Start observing when page loads
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', observeChat);
-} else {
-  observeChat();
-}
+// Log when content script loads
+console.log('[Gemini Exporter] Content script loaded on:', window.location.href);

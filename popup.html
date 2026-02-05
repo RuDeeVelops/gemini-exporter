@@ -96,18 +96,27 @@
       font-size: 13px;
       text-align: center;
       display: none;
+      animation: pulse 1.5s infinite;
+    }
+    
+    @keyframes pulse {
+      0% { opacity: 1; }
+      50% { opacity: 0.8; }
+      100% { opacity: 1; }
     }
     
     #status.success {
       background: #d4edda;
       color: #155724;
       border: 1px solid #c3e6cb;
+      animation: none;
     }
     
     #status.error {
       background: #f8d7da;
       color: #721c24;
       border: 1px solid #f5c6cb;
+      animation: none;
     }
     
     #status.info {
@@ -147,9 +156,9 @@
     <h1>💬 Gemini Exporter</h1>
     
     <div class="info">
-      <strong>Status:</strong> Ready to export
+      <strong>📜 FULL HISTORY EXPORT</strong>
       <br>
-      <span id="messageCount">Click a button to export your chat instantly</span>
+      <span id="messageCount">Will scroll and load your ENTIRE chat from the beginning</span>
     </div>
     
     <div class="export-section">

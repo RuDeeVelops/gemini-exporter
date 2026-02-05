@@ -1,6 +1,7 @@
 // Popup script for handling export actions
 
 let chatData = null;
+let progressInterval = null;
 
 // Show status message
 function showStatus(message, type = 'info') {
@@ -17,15 +18,48 @@ function showStatus(message, type = 'info') {
   }
 }
 
+// Update progress display
+function updateProgress(message) {
+  const statusDiv = document.getElementById('status');
+  statusDiv.textContent = message;
+  statusDiv.className = 'info';
+  statusDiv.style.display = 'block';
+  
+  // Also update the message count area with animation
+  const countDiv = document.getElementById('messageCount');
+  countDiv.textContent = message;
+}
+
 // Show/hide loader
 function toggleLoader(show) {
   document.getElementById('loader').style.display = show ? 'block' : 'none';
 }
 
+// Listen for progress messages from content script
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === 'progress') {
+    updateProgress(request.message || `Loading... (${request.iteration || 0} iterations)`);
+  }
+});
+
 // Extract chat data from the active tab
 async function extractChatData() {
   toggleLoader(true);
-  showStatus('Loading entire chat history... This may take a moment for long conversations.', 'info');
+  chatData = null;
+  
+  showStatus('🔄 FORCE loading entire chat history from the beginning...', 'info');
+  document.getElementById('messageCount').textContent = 'Scrolling to load ALL messages...';
+  
+  // Animated progress indicator
+  let dots = 0;
+  progressInterval = setInterval(() => {
+    dots = (dots + 1) % 4;
+    const dotStr = '.'.repeat(dots);
+    const currentStatus = document.getElementById('status').textContent;
+    if (currentStatus.startsWith('🔄')) {
+      // Keep the animation going
+    }
+  }, 500);
   
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -36,22 +70,26 @@ async function extractChatData() {
       throw new Error('Please navigate to a Gemini chat page first');
     }
     
+    showStatus('🔄 Scrolling to top to load oldest messages...', 'info');
+    
     const response = await chrome.tabs.sendMessage(tab.id, { action: 'extractChat' });
     
     if (response.success) {
       chatData = response.data;
       document.getElementById('messageCount').textContent = 
-        `Found ${chatData.messageCount} messages ready to export`;
-      showStatus('✅ Complete chat history loaded successfully!', 'success');
+        `✅ Found ${chatData.messageCount} messages ready to export!`;
+      showStatus(`✅ SUCCESS! Loaded ${chatData.messageCount} messages from entire chat history!`, 'success');
       return chatData;
     } else {
       throw new Error(response.error || 'Failed to extract chat data');
     }
   } catch (error) {
-    showStatus(`Error: ${error.message}`, 'error');
+    showStatus(`❌ Error: ${error.message}`, 'error');
+    document.getElementById('messageCount').textContent = 'Error loading chat';
     console.error('Extraction error:', error);
     return null;
   } finally {
+    clearInterval(progressInterval);
     toggleLoader(false);
   }
 }
