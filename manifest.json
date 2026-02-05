@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Gemini Chat Exporter",
-  "version": "1.0.0",
-  "description": "Instantly export Gemini chat conversations without scrolling",
+  "version": "2.0.0",
+  "description": "Export complete Gemini chat history with automatic loading",
   "permissions": [
     "activeTab",
     "scripting"

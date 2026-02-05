@@ -25,7 +25,7 @@ function toggleLoader(show) {
 // Extract chat data from the active tab
 async function extractChatData() {
   toggleLoader(true);
-  showStatus('Extracting chat data...', 'info');
+  showStatus('Loading entire chat history... This may take a moment for long conversations.', 'info');
   
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -42,7 +42,7 @@ async function extractChatData() {
       chatData = response.data;
       document.getElementById('messageCount').textContent = 
         `Found ${chatData.messageCount} messages ready to export`;
-      showStatus('Chat data extracted successfully!', 'success');
+      showStatus('✅ Complete chat history loaded successfully!', 'success');
       return chatData;
     } else {
       throw new Error(response.error || 'Failed to extract chat data');
