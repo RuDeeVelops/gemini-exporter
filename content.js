@@ -1,9 +1,355 @@
 // Content script that extracts chat messages from Gemini
-// Forces loading of ENTIRE chat history by scrolling to top
+// Uses multiple strategies: Internal state > API interception > DOM parsing
 
 // Global state for progress tracking
 let isLoading = false;
 let loadingProgress = { loaded: 0, status: 'idle' };
+let interceptedData = [];
+
+// ============================================
+// STRATEGY 1: Extract from page's internal data
+// ============================================
+
+function extractFromInternalState() {
+  console.log('[Gemini Exporter] Trying to extract from internal state...');
+  
+  // Look for data in common Google app patterns
+  const dataLocations = [
+    // Check for embedded JSON in script tags
+    () => findEmbeddedJSON(),
+    // Check window objects for conversation data
+    () => findWindowData(),
+    // Check for React fiber data
+    () => findReactData(),
+    // Check for Angular data
+    () => findAngularData(),
+  ];
+  
+  for (const finder of dataLocations) {
+    try {
+      const data = finder();
+      if (data && data.length > 0) {
+        console.log(`[Gemini Exporter] Found ${data.length} messages in internal state`);
+        return data;
+      }
+    } catch (e) {
+      console.log('[Gemini Exporter] Strategy failed:', e.message);
+    }
+  }
+  
+  return null;
+}
+
+// Find JSON data embedded in script tags (common in Google apps)
+function findEmbeddedJSON() {
+  const scripts = document.querySelectorAll('script:not([src])');
+  const messages = [];
+  
+  for (const script of scripts) {
+    const content = script.textContent || '';
+    
+    // Look for conversation-like data structures
+    // Google often uses AF_initDataCallback or similar
+    const patterns = [
+      /AF_initDataCallback\(([\s\S]*?)\);/g,
+      /window\['[\w]+'\]\s*=\s*(\{[\s\S]*?\});/g,
+      /\["[\w]+",\s*(\[[\s\S]*?\])\]/g,
+    ];
+    
+    for (const pattern of patterns) {
+      let match;
+      while ((match = pattern.exec(content)) !== null) {
+        try {
+          const parsed = JSON.parse(match[1]);
+          const extracted = extractMessagesFromObject(parsed);
+          if (extracted.length > 0) {
+            messages.push(...extracted);
+          }
+        } catch (e) {
+          // Not valid JSON, continue
+        }
+      }
+    }
+    
+    // Also try to find large JSON blobs that might contain conversations
+    const jsonMatches = content.match(/\{[^{}]*"(?:content|text|message|query|response)"[^{}]*\}/g);
+    if (jsonMatches) {
+      for (const jsonStr of jsonMatches) {
+        try {
+          const obj = JSON.parse(jsonStr);
+          if (obj.content || obj.text || obj.message) {
+            messages.push({
+              role: obj.role || (obj.isUser ? 'user' : 'assistant'),
+              content: obj.content || obj.text || obj.message,
+              raw: obj
+            });
+          }
+        } catch (e) {
+          // Continue
+        }
+      }
+    }
+  }
+  
+  return messages.length > 0 ? messages : null;
+}
+
+// Recursively extract messages from any object structure
+function extractMessagesFromObject(obj, depth = 0) {
+  const messages = [];
+  if (depth > 10) return messages; // Prevent infinite recursion
+  
+  if (!obj || typeof obj !== 'object') return messages;
+  
+  // Check if this object looks like a message
+  if (obj.content || obj.text || obj.message || obj.parts) {
+    const content = obj.content || obj.text || obj.message || 
+                   (Array.isArray(obj.parts) ? obj.parts.map(p => p.text || p).join('') : null);
+    
+    if (content && typeof content === 'string' && content.length > 5) {
+      messages.push({
+        role: obj.role || obj.author || (obj.isUser ? 'user' : 'assistant'),
+        content: content,
+        raw: obj
+      });
+    }
+  }
+  
+  // Recurse into arrays and objects
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      messages.push(...extractMessagesFromObject(item, depth + 1));
+    }
+  } else {
+    for (const key of Object.keys(obj)) {
+      messages.push(...extractMessagesFromObject(obj[key], depth + 1));
+    }
+  }
+  
+  return messages;
+}
+
+// Check window object for conversation data
+function findWindowData() {
+  const messages = [];
+  
+  // Common data storage patterns in Google apps
+  const windowKeys = Object.keys(window).filter(key => {
+    const lower = key.toLowerCase();
+    return lower.includes('data') || lower.includes('state') || 
+           lower.includes('store') || lower.includes('conversation') ||
+           lower.includes('chat') || lower.includes('message');
+  });
+  
+  for (const key of windowKeys) {
+    try {
+      const data = window[key];
+      const extracted = extractMessagesFromObject(data);
+      if (extracted.length > 0) {
+        messages.push(...extracted);
+      }
+    } catch (e) {
+      // Property access failed
+    }
+  }
+  
+  // Also check for __NEXT_DATA__, __NUXT__, etc.
+  const knownStores = ['__NEXT_DATA__', '__NUXT__', '__initialState__', '__PRELOADED_STATE__'];
+  for (const store of knownStores) {
+    try {
+      if (window[store]) {
+        const extracted = extractMessagesFromObject(window[store]);
+        messages.push(...extracted);
+      }
+    } catch (e) {
+      // Continue
+    }
+  }
+  
+  return messages.length > 0 ? messages : null;
+}
+
+// Try to extract from React internal state
+function findReactData() {
+  const messages = [];
+  
+  // Find React root
+  const root = document.getElementById('root') || document.getElementById('__next') || 
+               document.querySelector('[data-reactroot]') || document.body;
+  
+  // Look for React fiber
+  const fiberKey = Object.keys(root).find(key => key.startsWith('__reactFiber') || key.startsWith('__reactInternalInstance'));
+  
+  if (fiberKey) {
+    try {
+      let fiber = root[fiberKey];
+      const visited = new Set();
+      
+      // Traverse fiber tree looking for conversation state
+      const queue = [fiber];
+      while (queue.length > 0 && visited.size < 1000) {
+        const current = queue.shift();
+        if (!current || visited.has(current)) continue;
+        visited.add(current);
+        
+        // Check memoizedState and memoizedProps for conversation data
+        if (current.memoizedState) {
+          const extracted = extractMessagesFromObject(current.memoizedState);
+          messages.push(...extracted);
+        }
+        if (current.memoizedProps) {
+          const extracted = extractMessagesFromObject(current.memoizedProps);
+          messages.push(...extracted);
+        }
+        
+        // Continue traversing
+        if (current.child) queue.push(current.child);
+        if (current.sibling) queue.push(current.sibling);
+        if (current.return) queue.push(current.return);
+      }
+    } catch (e) {
+      console.log('[Gemini Exporter] React traversal error:', e.message);
+    }
+  }
+  
+  return messages.length > 0 ? messages : null;
+}
+
+// Try to extract from Angular state
+function findAngularData() {
+  const messages = [];
+  
+  // Angular often stores data in ng-* attributes or global angular object
+  const ngElements = document.querySelectorAll('[ng-model], [ng-bind], [_ngcontent]');
+  
+  for (const el of ngElements) {
+    try {
+      // Try to get Angular scope
+      const scope = window.angular?.element(el)?.scope?.();
+      if (scope) {
+        const extracted = extractMessagesFromObject(scope);
+        messages.push(...extracted);
+      }
+    } catch (e) {
+      // Continue
+    }
+  }
+  
+  return messages.length > 0 ? messages : null;
+}
+
+// ============================================
+// STRATEGY 2: Intercept API calls
+// ============================================
+
+function setupFetchInterceptor() {
+  console.log('[Gemini Exporter] Setting up fetch interceptor...');
+  
+  // Store original fetch
+  const originalFetch = window.fetch;
+  
+  window.fetch = async function(...args) {
+    const response = await originalFetch.apply(this, args);
+    
+    // Clone response so we can read it
+    const clone = response.clone();
+    
+    try {
+      const url = args[0]?.url || args[0];
+      
+      // Check if this might be a conversation API call
+      if (typeof url === 'string' && 
+          (url.includes('conversation') || url.includes('chat') || 
+           url.includes('batchexecute') || url.includes('generate'))) {
+        
+        const text = await clone.text();
+        
+        // Try to parse and extract messages
+        try {
+          // Google APIs often return data in a weird format
+          // Try multiple parsing strategies
+          let data;
+          
+          // Remove XSSI prevention prefix if present
+          const cleanText = text.replace(/^\)\]\}'/, '');
+          
+          try {
+            data = JSON.parse(cleanText);
+          } catch {
+            // Try to find JSON in the response
+            const jsonMatch = cleanText.match(/\[[\s\S]*\]/);
+            if (jsonMatch) {
+              data = JSON.parse(jsonMatch[0]);
+            }
+          }
+          
+          if (data) {
+            const extracted = extractMessagesFromObject(data);
+            if (extracted.length > 0) {
+              console.log(`[Gemini Exporter] Intercepted ${extracted.length} messages from API`);
+              interceptedData.push(...extracted);
+            }
+          }
+        } catch (e) {
+          // Parse failed, continue
+        }
+      }
+    } catch (e) {
+      // Clone/read failed, continue
+    }
+    
+    return response;
+  };
+  
+  // Also intercept XHR
+  const originalXHROpen = XMLHttpRequest.prototype.open;
+  const originalXHRSend = XMLHttpRequest.prototype.send;
+  
+  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+    this._url = url;
+    return originalXHROpen.apply(this, [method, url, ...rest]);
+  };
+  
+  XMLHttpRequest.prototype.send = function(...args) {
+    this.addEventListener('load', function() {
+      try {
+        if (this._url && 
+            (this._url.includes('conversation') || this._url.includes('chat') ||
+             this._url.includes('batchexecute') || this._url.includes('generate'))) {
+          
+          const text = this.responseText;
+          const cleanText = text.replace(/^\)\]\}'/, '');
+          
+          try {
+            const data = JSON.parse(cleanText);
+            const extracted = extractMessagesFromObject(data);
+            if (extracted.length > 0) {
+              console.log(`[Gemini Exporter] Intercepted ${extracted.length} messages from XHR`);
+              interceptedData.push(...extracted);
+            }
+          } catch (e) {
+            // Continue
+          }
+        }
+      } catch (e) {
+        // Continue
+      }
+    });
+    
+    return originalXHRSend.apply(this, args);
+  };
+}
+
+// Setup interceptor on load
+try {
+  setupFetchInterceptor();
+} catch (e) {
+  console.log('[Gemini Exporter] Could not setup interceptor:', e.message);
+}
+
+// ============================================
+// STRATEGY 3: Fallback to DOM + scroll (original method)
+// ============================================
 
 // Find the ACTUAL scrollable container (the one that holds messages)
 function findScrollableContainer() {
@@ -570,14 +916,47 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           }
         };
         
-        // FORCE load the entire chat history by scrolling to TOP
-        await forceLoadEntireHistory(sendProgress);
+        let messages = [];
         
-        // Extract all messages from the fully loaded DOM
-        const messages = extractChatMessages();
+        // ======== STRATEGY 1: Try internal state extraction first (FAST) ========
+        sendProgress({ status: 'loading', message: '🔍 Analyzing page data structures...' });
+        console.log('[Gemini Exporter] === TRYING STRATEGY 1: Internal State ===');
+        
+        const internalMessages = extractFromInternalState();
+        if (internalMessages && internalMessages.length > 5) {
+          console.log(`[Gemini Exporter] SUCCESS! Found ${internalMessages.length} messages in internal state`);
+          messages = internalMessages;
+        }
+        
+        // ======== STRATEGY 2: Check intercepted API data ========
+        if (messages.length === 0 && interceptedData.length > 0) {
+          console.log('[Gemini Exporter] === TRYING STRATEGY 2: Intercepted Data ===');
+          sendProgress({ status: 'loading', message: '📡 Using intercepted API data...' });
+          messages = deduplicateMessages(interceptedData);
+          console.log(`[Gemini Exporter] Found ${messages.length} messages from intercepted data`);
+        }
+        
+        // ======== STRATEGY 3: Fallback to DOM scraping with scroll (SLOW but reliable) ========
+        if (messages.length === 0) {
+          console.log('[Gemini Exporter] === TRYING STRATEGY 3: DOM Scraping ===');
+          sendProgress({ status: 'loading', message: '📜 Falling back to DOM extraction...' });
+          
+          // Force load entire history by scrolling
+          await forceLoadEntireHistory(sendProgress);
+          
+          // Expand truncated messages
+          sendProgress({ status: 'expanding', message: '📖 Expanding all truncated messages...' });
+          await expandAllTruncatedMessages();
+          
+          // Extract from DOM
+          messages = extractChatMessages();
+        }
+        
+        // Deduplicate and clean messages
+        messages = deduplicateMessages(messages);
         const title = getChatTitle();
         
-        console.log(`[Gemini Exporter] Extracted ${messages.length} messages`);
+        console.log(`[Gemini Exporter] ✅ Final result: ${messages.length} messages extracted`);
         
         sendResponse({
           success: true,
@@ -602,5 +981,30 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   return true;
 });
 
+// Deduplicate messages based on content
+function deduplicateMessages(messages) {
+  const seen = new Set();
+  const unique = [];
+  
+  for (const msg of messages) {
+    const content = (msg.content || '').trim();
+    if (content.length < 5) continue;
+    
+    // Use first 200 chars as key to handle minor differences
+    const key = content.substring(0, 200);
+    if (!seen.has(key)) {
+      seen.add(key);
+      unique.push({
+        role: msg.role || 'assistant',
+        content: content,
+        timestamp: msg.timestamp || new Date().toISOString()
+      });
+    }
+  }
+  
+  return unique;
+}
+
 // Log when content script loads
 console.log('[Gemini Exporter] Content script loaded on:', window.location.href);
+console.log('[Gemini Exporter] Fetch/XHR interceptors active. API responses will be captured.');
