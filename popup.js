@@ -30,7 +30,9 @@ async function extractChatData() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     
-    if (!tab.url.includes('gemini.google.com')) {
+    // Validate that the URL is actually from gemini.google.com domain
+    const url = new URL(tab.url);
+    if (url.hostname !== 'gemini.google.com') {
       throw new Error('Please navigate to a Gemini chat page first');
     }
     
