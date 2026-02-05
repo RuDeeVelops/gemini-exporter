@@ -38,7 +38,18 @@ function toggleLoader(show) {
 // Listen for progress messages from content script
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'progress') {
-    updateProgress(request.message || `Loading... (${request.iteration || 0} iterations)`);
+    let message = request.message || `Loading... (${request.iteration || 0} iterations)`;
+    
+    // Add emoji based on status
+    if (request.status === 'loading') {
+      message = '🔄 ' + message;
+    } else if (request.status === 'expanding') {
+      message = '📖 ' + message;
+    } else if (request.status === 'extracting') {
+      message = '📤 ' + message;
+    }
+    
+    updateProgress(message);
   }
 });
 

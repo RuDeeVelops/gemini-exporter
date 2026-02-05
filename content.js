@@ -128,6 +128,10 @@ async function forceLoadEntireHistory(sendProgress) {
     await wait(100);
   }
   
+  // EXPAND ALL TRUNCATED MESSAGES
+  sendProgress({ status: 'expanding', message: 'Expanding all truncated messages...', iteration });
+  await expandAllTruncatedMessages();
+  
   // Go back to top for extraction
   container.scrollTop = 0;
   await wait(200);
@@ -139,6 +143,119 @@ async function forceLoadEntireHistory(sendProgress) {
   sendProgress({ status: 'extracting', message: 'Extracting messages...', iteration });
   
   return true;
+}
+
+// EXPAND ALL TRUNCATED/COLLAPSED MESSAGES
+async function expandAllTruncatedMessages() {
+  console.log('[Gemini Exporter] Looking for truncated messages to expand...');
+  
+  // Common patterns for "show more" / "expand" buttons in Gemini
+  const expandSelectors = [
+    // Text-based buttons
+    'button:not([disabled])',
+    '[role="button"]',
+    '[class*="expand"]',
+    '[class*="show-more"]',
+    '[class*="see-more"]',
+    '[class*="read-more"]',
+    '[class*="truncat"]',
+    '[aria-expanded="false"]',
+    // Material design expand icons
+    '[class*="expand_more"]',
+    '[class*="unfold"]',
+    // Generic clickable elements that might expand content
+    '[data-action*="expand"]',
+    '[data-test-id*="expand"]',
+    '[data-test-id*="show"]'
+  ];
+  
+  let totalExpanded = 0;
+  let passCount = 0;
+  const maxPasses = 5; // Multiple passes in case expanding reveals more content
+  
+  while (passCount < maxPasses) {
+    passCount++;
+    let expandedThisPass = 0;
+    
+    for (const selector of expandSelectors) {
+      try {
+        const elements = document.querySelectorAll(selector);
+        
+        for (const el of elements) {
+          // Check if this looks like an expand button
+          const text = (el.textContent || '').toLowerCase();
+          const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+          const title = (el.getAttribute('title') || '').toLowerCase();
+          const className = (el.className || '').toLowerCase();
+          
+          const isExpandButton = 
+            text.includes('show more') ||
+            text.includes('see more') ||
+            text.includes('read more') ||
+            text.includes('expand') ||
+            text.includes('view more') ||
+            text.includes('more') && text.length < 20 ||
+            text.includes('...') && text.length < 10 ||
+            ariaLabel.includes('expand') ||
+            ariaLabel.includes('show more') ||
+            title.includes('expand') ||
+            title.includes('show') ||
+            className.includes('expand') ||
+            className.includes('truncat') ||
+            className.includes('collapsed') ||
+            el.getAttribute('aria-expanded') === 'false';
+          
+          if (isExpandButton && el.offsetParent !== null) { // Check if visible
+            try {
+              console.log(`[Gemini Exporter] Clicking expand button: "${text.substring(0, 30)}"`);
+              el.click();
+              expandedThisPass++;
+              totalExpanded++;
+              await wait(150); // Wait for expansion animation
+            } catch (e) {
+              // Click failed, continue
+            }
+          }
+        }
+      } catch (e) {
+        // Selector failed, continue
+      }
+    }
+    
+    // Also try to find and click any elements with "..." that might be truncation indicators
+    const allElements = document.querySelectorAll('span, div, p');
+    for (const el of allElements) {
+      const text = el.textContent || '';
+      // Look for truncation patterns
+      if (text.endsWith('...') || text.endsWith('… ') || text.includes('Show more')) {
+        // Check if there's a clickable parent or sibling
+        const clickableParent = el.closest('button, [role="button"], [onclick], [class*="click"]');
+        if (clickableParent && clickableParent.offsetParent !== null) {
+          try {
+            clickableParent.click();
+            expandedThisPass++;
+            totalExpanded++;
+            await wait(150);
+          } catch (e) {
+            // Continue
+          }
+        }
+      }
+    }
+    
+    console.log(`[Gemini Exporter] Pass ${passCount}: expanded ${expandedThisPass} elements`);
+    
+    // If nothing was expanded this pass, we're done
+    if (expandedThisPass === 0) {
+      break;
+    }
+    
+    // Wait for DOM to update
+    await wait(300);
+  }
+  
+  console.log(`[Gemini Exporter] Total expanded: ${totalExpanded} truncated messages`);
+  return totalExpanded;
 }
 
 // Wait helper
