@@ -1,4 +1,12 @@
-# Why This Extension is Efficient ⚡
+# How This Extension Works ⚡
+
+## The Reality of Lazy Loading
+
+**Important**: Gemini uses **lazy loading**. Old messages are NOT stored in browser memory - they are fetched from the server on-demand as you scroll. This means:
+
+- Only recent/visible messages exist in the DOM initially
+- Scrolling triggers API calls to fetch older messages
+- There is NO shortcut to bypass this - you MUST trigger the loading
 
 ## The Problem with Manual Export
 
@@ -10,16 +18,17 @@ When you try to export a long Gemini chat manually:
 4. **Manual copying** - Error-prone and time-consuming
 5. **Formatting issues** - Loses structure when copying
 6. **Easy to miss messages** - Scroll too fast and content doesn't load
+7. **Truncated user messages** - Long prompts are shortened in the UI
 
 ### Time Comparison
 - **Manual method**: 10-20 minutes for a long chat (with constant attention)
 - **This extension**: 30 seconds to 2 minutes (fully automated) ⚡
 
-## How This Extension Works Differently
+## How This Extension Works
 
-### Automated Complete History Loading
+### 1. Automated Scroll Loading (Required)
 
-This extension automatically loads your entire chat history:
+Since lazy loading is mandatory, we automate the scroll process:
 
 ```javascript
 // Manual method (TEDIOUS):
@@ -30,14 +39,28 @@ while (notAtTop) {
 }
 
 // Our method (AUTOMATED):
-await loadEntireChatHistory();   // ⚡ Fully automated!
-const messages = extractAllMessages(); // ⚡ Complete extraction!
-downloadFile(messages);           // ⚡ One click!
+await forceLoadEntireHistory();  // ⚡ Scrolls programmatically!
+await expandTruncatedMessages(); // ⚡ Clicks "show more" buttons!
+const messages = extractAll();   // ⚡ Complete extraction!
 ```
 
-### Intelligent Loading Strategy
+### 2. API Interception (Full Text Capture)
 
-The extension uses a multi-phase approach:
+The extension intercepts `fetch()` and `XMLHttpRequest` to capture the FULL untruncated message content as it's loaded:
+
+```javascript
+// Intercept API responses
+window.fetch = async function(...args) {
+  const response = await originalFetch(...args);
+  // Capture full message text from API response
+  parseAndStoreMessages(await response.clone().text());
+  return response;
+};
+```
+
+This means even if the DOM shows truncated text, we may have the full version from the API.
+
+### 3. Multi-Phase Loading Strategy
 
 ```
 Phase 1: Jump to Top
